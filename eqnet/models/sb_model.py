@@ -1,7 +1,9 @@
 from typing import Any
 
 import seisbench.models as sbm
+import seisbench.util as sbu
 import torch
+import numpy as np
 from torch import Tensor, nn
 import torch.nn.functional as F
 
@@ -9,19 +11,30 @@ from .unet import UNet
 
 
 class PhaseNet(sbm.WaveformModel):
+    # TODO: Update args
+    _annotate_args = sbm.WaveformModel._annotate_args.copy()
+    _annotate_args["*_threshold"] = ("Detection threshold for the provided phase", 0.3)
+    _annotate_args["blinding"] = (
+        "Number of prediction samples to discard on each side of each window prediction",
+        (0, 0),
+    )
+    _annotate_args["overlap"] = (_annotate_args["overlap"][0], 0.5)
+
     def __init__(
         self,
         log_scale=True,
         add_polarity=True,
         add_event=True,
         sampling_rate=100,
+        **kwargs,
     ) -> None:
         super().__init__(
-            in_samples=4096,
+            in_samples=1024,
             output_type="array",
-            pred_sample=(0, 4096),
-            labels=["N", "P", "S", "None", "Up", "Down"],
+            pred_sample=(0, 1024),
+            labels=["N", "P", "S", "Polarity", "Event center", "Event time"],
             sampling_rate=sampling_rate,
+            **kwargs,
         )
         self.add_event = add_event
         self.add_polarity = add_polarity
@@ -49,9 +62,17 @@ class PhaseNet(sbm.WaveformModel):
             output["event_time"] = output_event_time
         if self.add_polarity:
             output_polarity = self.polarity_picker(features, logits)
-            output["polarity"] = output_polarity
+            output["polarity_3c"] = output_polarity
+            # TODO: Check sign and components
+            output["polarity"] =  output_polarity[:, 2:3] - output_polarity[:, 1:2]
 
         return output
+
+    def _get_in_pred_samples(self, block: np.ndarray) -> tuple[int, tuple[int, int]]:
+        in_samples = 2 ** int(np.log2(block.shape[-1]))  # The largest power of 2 below the block shape
+        in_samples = min(max(in_samples, 2 ** 10), 2 ** 20)  # Enforce upper and lower bounds
+        pred_sample = (0, in_samples)
+        return in_samples, pred_sample
 
     def annotate_batch_pre(
             self, batch: torch.Tensor, argdict: dict[str, Any]
@@ -63,11 +84,69 @@ class PhaseNet(sbm.WaveformModel):
     ) -> torch.Tensor:
         y_phase = batch["phase"][..., 0]
         y_polarity = batch["polarity"][..., 0]
+        y_center = torch.repeat_interleave(batch["event_center"][..., 0], 16, dim=-1)
+        y_time = torch.repeat_interleave(batch["event_time"][..., 0], 16, dim=-1)
 
-        y_full = torch.concat([y_phase, y_polarity], dim=1)
+        y_full = torch.concat([y_phase, y_polarity, y_center, y_time], dim=1)
+
+        prenan, postnan = argdict.get(
+            "blinding", self._annotate_args.get("blinding")[1]
+        )
+        if prenan > 0:
+            y_full[..., :prenan] = np.nan
+        if postnan > 0:
+            y_full[..., -postnan:] = np.nan
 
         return torch.transpose(y_full, -1, -2)
 
+    def classify_aggregate(self, annotations, argdict) -> sbu.ClassifyOutput:
+        """
+        Converts the annotations to discrete picks (mode "pick") or events (mode "event").
+
+        :param annotations: See description in superclass
+        :param argdict: See description in superclass
+        :return: List of picks
+        """
+        mode = argdict.get("mode", "pick")
+        if mode == "pick":
+            return self.classify_aggregate_pick(annotations, argdict)
+        elif mode == "event":
+            return self.classify_aggregate_event(annotations, argdict)
+        else:
+            raise NotImplementedError(f"Mode '{mode}' unknown")
+
+    def classify_aggregate_pick(self, annotations, argdict) -> sbu.ClassifyOutput:
+        """
+        Converts the annotations to discrete thresholds using
+        :py:func:`~seisbench.models.base.WaveformModel.picks_from_annotations`.
+        Trigger onset thresholds for picks are derived from the argdict at keys "[phase]_threshold".
+
+        :param annotations: See description in superclass
+        :param argdict: See description in superclass
+        :return: List of picks
+        """
+        picks = sbu.PickList()
+        for phase in "PS":
+            picks += self.picks_from_annotations(
+                annotations.select(channel=f"{self.__class__.__name__}_{phase}"),
+                argdict.get(
+                    f"{phase}_threshold", self._annotate_args.get("*_threshold")[1]
+                ),
+                phase,
+            )
+
+        picks = sbu.PickList(sorted(picks))
+
+        return sbu.ClassifyOutput(self.name, picks=picks)
+
+    def classify_aggregate_event(self, annotations, argdict) -> sbu.ClassifyOutput:
+        """
+
+        """
+        # TODO: Document
+        # TODO: Implement
+
+        return sbu.ClassifyOutput(self.name)
 
 class UNetHead(nn.Module):
     def __init__(
