@@ -7,7 +7,7 @@ import numpy as np
 from torch import Tensor, nn
 import torch.nn.functional as F
 
-from .unet import UNet
+from eqnet.models.unet import UNet
 
 
 class PhaseNet(sbm.WaveformModel):
